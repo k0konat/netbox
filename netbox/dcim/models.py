@@ -9,6 +9,7 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import Count, Q, ObjectDoesNotExist
 
+from circuits.models import Circuit
 from extras.models import CustomFieldModel, CustomField, CustomFieldValue
 from extras.rpc import RPC_CLIENTS
 from tenancy.models import Tenant
@@ -264,7 +265,7 @@ class Site(CreatedUpdatedModel, CustomFieldModel):
             self.slug,
             self.tenant.name if self.tenant else '',
             self.facility,
-            str(self.asn),
+            str(self.asn) if self.asn else '',
         ])
 
     @property
@@ -285,7 +286,7 @@ class Site(CreatedUpdatedModel, CustomFieldModel):
 
     @property
     def count_circuits(self):
-        return self.circuits.count()
+        return Circuit.objects.filter(terminations__site=self).count()
 
 
 #
@@ -520,7 +521,7 @@ class Manufacturer(models.Model):
         return "{}?manufacturer={}".format(reverse('dcim:devicetype_list'), self.slug)
 
 
-class DeviceType(models.Model):
+class DeviceType(models.Model, CustomFieldModel):
     """
     A DeviceType represents a particular make (Manufacturer) and model of device. It specifies rack height and depth, as
     well as high-level functional role(s).
@@ -552,6 +553,8 @@ class DeviceType(models.Model):
                                              choices=SUBDEVICE_ROLE_CHOICES,
                                              help_text="Parent devices house child devices in device bays. Select "
                                                        "\"None\" if this device type is neither a parent nor a child.")
+    comments = models.TextField(blank=True)
+    custom_field_values = GenericRelation(CustomFieldValue, content_type_field='obj_type', object_id_field='obj_id')
 
     class Meta:
         ordering = ['manufacturer', 'model']
@@ -1136,7 +1139,7 @@ class Interface(models.Model):
     @property
     def is_connected(self):
         try:
-            return bool(self.circuit)
+            return bool(self.circuit_termination)
         except ObjectDoesNotExist:
             pass
         return bool(self.connection)

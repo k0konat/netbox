@@ -14,7 +14,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.http import urlencode
 from django.views.generic import View
 
-from ipam.models import Prefix, IPAddress, VLAN
+from ipam.models import Prefix, IPAddress, Service, VLAN
 from circuits.models import Circuit
 from extras.models import Graph, TopologyMap, GRAPH_TYPE_INTERFACE, GRAPH_TYPE_SITE
 from utilities.forms import ConfirmationForm
@@ -78,7 +78,7 @@ def site(request, slug):
         'device_count': Device.objects.filter(rack__site=site).count(),
         'prefix_count': Prefix.objects.filter(site=site).count(),
         'vlan_count': VLAN.objects.filter(site=site).count(),
-        'circuit_count': Circuit.objects.filter(site=site).count(),
+        'circuit_count': Circuit.objects.filter(terminations__site=site).count(),
     }
     rack_groups = RackGroup.objects.filter(site=site).annotate(rack_count=Count('racks'))
     topology_maps = TopologyMap.objects.filter(site=site)
@@ -331,6 +331,7 @@ class DeviceTypeEditView(PermissionRequiredMixin, ObjectEditView):
     permission_required = 'dcim.change_devicetype'
     model = DeviceType
     form_class = forms.DeviceTypeForm
+    template_name = 'dcim/devicetype_edit.html'
     obj_list_url = 'dcim:devicetype_list'
 
 
@@ -561,20 +562,19 @@ def device(request, pk):
         PowerOutlet.objects.filter(device=device).select_related('connected_port'), key=attrgetter('name')
     )
     interfaces = Interface.objects.filter(device=device, mgmt_only=False)\
-        .select_related('connected_as_a', 'connected_as_b', 'circuit')
+        .select_related('connected_as_a', 'connected_as_b', 'circuit_termination__circuit')
     mgmt_interfaces = Interface.objects.filter(device=device, mgmt_only=True)\
-        .select_related('connected_as_a', 'connected_as_b', 'circuit')
+        .select_related('connected_as_a', 'connected_as_b', 'circuit_termination__circuit')
     device_bays = natsorted(
         DeviceBay.objects.filter(device=device).select_related('installed_device__device_type__manufacturer'),
         key=attrgetter('name')
     )
 
-    # Gather any secrets which belong to this device
-    secrets = device.secrets.all()
-
-    # Find all IP addresses assigned to this device
+    # Gather relevant device objects
     ip_addresses = IPAddress.objects.filter(interface__device=device).select_related('interface', 'vrf')\
         .order_by('address')
+    services = Service.objects.filter(device=device)
+    secrets = device.secrets.all()
 
     # Find any related devices for convenient linking in the UI
     related_devices = []
@@ -604,6 +604,7 @@ def device(request, pk):
         'mgmt_interfaces': mgmt_interfaces,
         'device_bays': device_bays,
         'ip_addresses': ip_addresses,
+        'services': services,
         'secrets': secrets,
         'related_devices': related_devices,
         'show_graphs': show_graphs,
@@ -687,13 +688,17 @@ def device_lldp_neighbors(request, pk):
     })
 
 
+#
+# Bulk device component creation
+#
+
 class DeviceBulkAddComponentView(View):
     """
     Add one or more components (e.g. interfaces) to a selected set of Devices.
     """
-    form = None
-    component_cls = None
-    component_form = None
+    form = forms.DeviceBulkAddComponentForm
+    model = None
+    model_form = None
 
     def get(self):
         return redirect('dcim:device_list')
@@ -721,18 +726,18 @@ class DeviceBulkAddComponentView(View):
                             'name': name,
                         }
                         component_data.update(data)
-                        component_form = self.component_form(component_data)
+                        component_form = self.model_form(component_data)
                         if component_form.is_valid():
                             new_components.append(component_form.save(commit=False))
                         else:
-                            form.add_error('name_pattern', "Duplicate {} name for {}: {}".format(
-                                self.component_cls._meta.verbose_name, device, name
-                            ))
+                            for field, errors in component_form.errors.as_data().items():
+                                for e in errors:
+                                    form.add_error(field, u'{} {}: {}'.format(device, name, ', '.join(e)))
 
                 if not form.errors:
-                    self.component_cls.objects.bulk_create(new_components)
+                    self.model.objects.bulk_create(new_components)
                     messages.success(request, u"Added {} {} to {} devices.".format(
-                        len(new_components), self.component_cls._meta.verbose_name_plural, len(form.cleaned_data['pk'])
+                        len(new_components), self.model._meta.verbose_name_plural, len(form.cleaned_data['pk'])
                     ))
                     return redirect('dcim:device_list')
 
@@ -746,19 +751,41 @@ class DeviceBulkAddComponentView(View):
 
         return render(request, 'dcim/device_bulk_add_component.html', {
             'form': form,
-            'component_name': self.component_cls._meta.verbose_name_plural,
+            'component_name': self.model._meta.verbose_name_plural,
             'selected_devices': selected_devices,
             'cancel_url': reverse('dcim:device_list'),
         })
 
 
+class DeviceBulkAddConsolePortView(DeviceBulkAddComponentView):
+    model = ConsolePort
+    model_form = forms.ConsolePortForm
+
+
+class DeviceBulkAddConsoleServerPortView(DeviceBulkAddComponentView):
+    model = ConsoleServerPort
+    model_form = forms.ConsoleServerPortForm
+
+
+class DeviceBulkAddPowerPortView(DeviceBulkAddComponentView):
+    model = PowerPort
+    model_form = forms.PowerPortForm
+
+
+class DeviceBulkAddPowerOutletView(DeviceBulkAddComponentView):
+    model = PowerOutlet
+    model_form = forms.PowerOutletForm
+
+
 class DeviceBulkAddInterfaceView(DeviceBulkAddComponentView):
-    """
-    Add one or more components (e.g. interfaces) to a selected set of Devices.
-    """
     form = forms.DeviceBulkAddInterfaceForm
-    component_cls = Interface
-    component_form = forms.InterfaceForm
+    model = Interface
+    model_form = forms.InterfaceForm
+
+
+class DeviceBulkAddDeviceBayView(DeviceBulkAddComponentView):
+    model = DeviceBay
+    model_form = forms.DeviceBayForm
 
 
 #
@@ -1467,9 +1494,11 @@ def interfaceconnection_add(request, pk):
 
     else:
         form = forms.InterfaceConnectionForm(device, initial={
-            'interface_a': request.GET.get('interface', None),
+            'interface_a': request.GET.get('interface_a', None),
+            'site_b': request.GET.get('site_b', device.rack.site),
             'rack_b': request.GET.get('rack_b', None),
             'device_b': request.GET.get('device_b', None),
+            'interface_b': request.GET.get('interface_b', None),
         })
 
     return render(request, 'dcim/interfaceconnection_edit.html', {
@@ -1602,38 +1631,16 @@ def ipaddress_assign(request, pk):
 # Modules
 #
 
-@permission_required('dcim.add_module')
-def module_add(request, pk):
-
-    device = get_object_or_404(Device, pk=pk)
-
-    if request.method == 'POST':
-        form = forms.ModuleForm(request.POST)
-        if form.is_valid():
-            module = form.save(commit=False)
-            module.device = device
-            module.save()
-            messages.success(request, u"Added module {} to {}".format(module.name, module.device.name))
-            if '_addanother' in request.POST:
-                return redirect('dcim:module_add', pk=module.device.pk)
-            else:
-                return redirect('dcim:device_inventory', pk=module.device.pk)
-
-    else:
-        form = forms.ModuleForm()
-
-    return render(request, 'dcim/device_component_add.html', {
-        'device': device,
-        'component_type': 'Module',
-        'form': form,
-        'cancel_url': reverse('dcim:device_inventory', kwargs={'pk': device.pk}),
-    })
-
-
 class ModuleEditView(PermissionRequiredMixin, ObjectEditView):
     permission_required = 'dcim.change_module'
     model = Module
     form_class = forms.ModuleForm
+
+    def alter_obj(self, obj, args, kwargs):
+        if 'device' in kwargs:
+            device = get_object_or_404(Device, pk=kwargs['device'])
+            obj.device = device
+        return obj
 
 
 class ModuleDeleteView(PermissionRequiredMixin, ObjectDeleteView):

@@ -254,16 +254,16 @@ class ManufacturerForm(forms.ModelForm, BootstrapMixin):
 # Device types
 #
 
-class DeviceTypeForm(forms.ModelForm, BootstrapMixin):
+class DeviceTypeForm(BootstrapMixin, CustomFieldForm):
     slug = SlugField(slug_source='model')
 
     class Meta:
         model = DeviceType
         fields = ['manufacturer', 'model', 'slug', 'part_number', 'u_height', 'is_full_depth', 'is_console_server',
-                  'is_pdu', 'is_network_device', 'subdevice_role']
+                  'is_pdu', 'is_network_device', 'subdevice_role', 'comments']
 
 
-class DeviceTypeBulkEditForm(BulkEditForm, BootstrapMixin):
+class DeviceTypeBulkEditForm(BootstrapMixin, CustomFieldBulkEditForm):
     pk = forms.ModelMultipleChoiceField(queryset=DeviceType.objects.all(), widget=forms.MultipleHiddenInput)
     manufacturer = forms.ModelChoiceField(queryset=Manufacturer.objects.all(), required=False)
     u_height = forms.IntegerField(min_value=1, required=False)
@@ -272,7 +272,8 @@ class DeviceTypeBulkEditForm(BulkEditForm, BootstrapMixin):
         nullable_fields = []
 
 
-class DeviceTypeFilterForm(forms.Form, BootstrapMixin):
+class DeviceTypeFilterForm(BootstrapMixin, CustomFieldFilterForm):
+    model = DeviceType
     manufacturer = FilterChoiceField(queryset=Manufacturer.objects.annotate(filter_count=Count('device_types')),
                                      to_field_name='slug')
 
@@ -587,18 +588,6 @@ class DeviceBulkEditForm(BootstrapMixin, CustomFieldBulkEditForm):
         nullable_fields = ['tenant', 'platform']
 
 
-class DeviceBulkAddComponentForm(forms.Form, BootstrapMixin):
-    pk = forms.ModelMultipleChoiceField(queryset=Device.objects.all(), widget=forms.MultipleHiddenInput)
-    name_pattern = ExpandableNameField(label='Name')
-
-
-class DeviceBulkAddInterfaceForm(forms.ModelForm, DeviceBulkAddComponentForm):
-
-    class Meta:
-        model = Interface
-        fields = ['name_pattern', 'form_factor', 'mgmt_only', 'description']
-
-
 class DeviceFilterForm(BootstrapMixin, CustomFieldFilterForm):
     model = Device
     site = FilterChoiceField(queryset=Site.objects.annotate(filter_count=Count('racks__devices')), to_field_name='slug')
@@ -613,6 +602,22 @@ class DeviceFilterForm(BootstrapMixin, CustomFieldFilterForm):
                                  to_field_name='slug', null_option=(0, 'None'))
     status = forms.NullBooleanField(required=False, widget=forms.Select(choices=FORM_STATUS_CHOICES))
     mac_address = forms.CharField(required=False, label='MAC address')
+
+
+#
+# Bulk device component creation
+#
+
+class DeviceBulkAddComponentForm(forms.Form, BootstrapMixin):
+    pk = forms.ModelMultipleChoiceField(queryset=Device.objects.all(), widget=forms.MultipleHiddenInput)
+    name_pattern = ExpandableNameField(label='Name')
+
+
+class DeviceBulkAddInterfaceForm(forms.ModelForm, DeviceBulkAddComponentForm):
+
+    class Meta:
+        model = Interface
+        fields = ['pk', 'name_pattern', 'form_factor', 'mgmt_only', 'description']
 
 
 #
@@ -1045,8 +1050,11 @@ class InterfaceBulkEditForm(BootstrapMixin, BulkEditForm):
 
 class InterfaceConnectionForm(forms.ModelForm, BootstrapMixin):
     interface_a = forms.ChoiceField(choices=[], widget=SelectWithDisabled, label='Interface')
+    site_b = forms.ModelChoiceField(queryset=Site.objects.all(), label='Site', required=False,
+                                    widget=forms.Select(attrs={'filter-for': 'rack_b'}))
     rack_b = forms.ModelChoiceField(queryset=Rack.objects.all(), label='Rack', required=False,
-                                    widget=forms.Select(attrs={'filter-for': 'device_b'}))
+                                    widget=APISelect(api_url='/api/dcim/racks/?site_id={{site_b}}',
+                                                     attrs={'filter-for': 'device_b'}))
     device_b = forms.ModelChoiceField(queryset=Device.objects.all(), label='Device', required=False,
                                       widget=APISelect(api_url='/api/dcim/devices/?rack_id={{rack_b}}',
                                                        display_field='display_name',
@@ -1060,13 +1068,11 @@ class InterfaceConnectionForm(forms.ModelForm, BootstrapMixin):
 
     class Meta:
         model = InterfaceConnection
-        fields = ['interface_a', 'rack_b', 'device_b', 'interface_b', 'livesearch', 'connection_status']
+        fields = ['interface_a', 'site_b', 'rack_b', 'device_b', 'interface_b', 'livesearch', 'connection_status']
 
     def __init__(self, device_a, *args, **kwargs):
 
         super(InterfaceConnectionForm, self).__init__(*args, **kwargs)
-
-        self.fields['rack_b'].queryset = Rack.objects.filter(site=device_a.rack.site)
 
         # Initialize interface A choices
         device_a_interfaces = Interface.objects.filter(device=device_a).exclude(form_factor=IFACE_FF_VIRTUAL) \
@@ -1074,6 +1080,14 @@ class InterfaceConnectionForm(forms.ModelForm, BootstrapMixin):
         self.fields['interface_a'].choices = [
             (iface.id, {'label': iface.name, 'disabled': iface.is_connected}) for iface in device_a_interfaces
         ]
+
+        # Initialize rack_b choices if site_b is set
+        if self.is_bound and self.data.get('site_b'):
+            self.fields['rack_b'].queryset = Rack.objects.filter(site__pk=self.data['site_b'])
+        elif self.initial.get('site_b'):
+            self.fields['rack_b'].queryset = Rack.objects.filter(site=self.initial['site_b'])
+        else:
+            self.fields['rack_b'].choices = []
 
         # Initialize device_b choices if rack_b is set
         if self.is_bound and self.data.get('rack_b'):
