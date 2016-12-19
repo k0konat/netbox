@@ -28,3 +28,4 @@ Questions? Comments? Please subscribe to [the netbox-discuss mailing list](https
 Please see [the documentation](http://netbox.readthedocs.io/en/latest/) for instructions on installing NetBox.
 
 To upgrade NetBox, please download the [latest release](https://github.com/digitalocean/netbox/releases) and run `upgrade.sh`.
+ADD a line to README
